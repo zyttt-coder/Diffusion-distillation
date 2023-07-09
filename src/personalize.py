@@ -6,7 +6,6 @@ from networks import *
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-
 class Config:
     imagenette_names = ["tench", "English springer", "cassette player", "chain saw", "church", "French horn", "garbage truck", "gas pump", "golf ball", "parachute"]
     imagenette = [0, 217, 482, 491, 497, 566, 569, 571, 574, 701]
