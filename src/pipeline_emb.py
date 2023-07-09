@@ -1,9 +1,8 @@
-from functools import partial
-
 import torch
 import torch.nn as nn
 import numpy as np
 
+from functools import partial
 from transformers import CLIPTokenizer
 
 def get_clip_token_for_string(tokenizer, string):

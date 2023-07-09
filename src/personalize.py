@@ -429,7 +429,6 @@ def rand_cutout(x, param):
     x = x * mask.unsqueeze(1)
     return x
 
-
 AUGMENT_FNS = {
     'color': [rand_brightness, rand_saturation, rand_contrast],
     'crop': [rand_crop],
