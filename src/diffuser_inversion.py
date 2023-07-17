@@ -387,10 +387,10 @@ def main():
     
 
     for it in range(args.num_train_steps):
-        # if it in eval_it_pool and it > 0:
-        #     save_this_it = eval_loop(args, accelerator, test_dataloader, best_acc, best_std, 
-        #                              model_eval_pool, it, channel, num_classes, im_size, label_syn, 
-        #                              ini_prompt_embed, emb_opt, subset_embed, pipeline, unet, vae, ini_latents, class_map = class_map)
+        if it in eval_it_pool and it > 0:
+            save_this_it = eval_loop(args, accelerator, test_dataloader, best_acc, best_std, 
+                                     model_eval_pool, it, channel, num_classes, im_size, label_syn, 
+                                     emb_opt, noise_scheduler, unet, vae, ini_latents, class_map = class_map)
             
         if it > 0 and ((it in eval_it_pool and (save_this_it or it % 1000 == 0)) or (
             args.save_it is not None and it % args.save_it == 0)):

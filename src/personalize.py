@@ -564,7 +564,7 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
         return net, acc_train_list, acc_test_list
 
 
-def eval_loop(args, accelerator, testloader, best_acc, best_std, model_eval_pool, it, channel, num_classes, im_size, label_syn, ini_prompt_embed, emb_opt, subset_embed, pipeline, unet, vae, ini_latents, class_map=None):
+def eval_loop(args, accelerator, testloader, best_acc, best_std, model_eval_pool, it, channel, num_classes, im_size, label_syn, emb_opt, noise_scheduler, unet, vae, ini_latents, class_map=None):
     curr_acc_dict = {}
     max_acc_dict = {}
 
@@ -587,15 +587,13 @@ def eval_loop(args, accelerator, testloader, best_acc, best_std, model_eval_pool
                                    dist=False).to(accelerator.device)  # get a random model
             label_syn_eval = label_syn.detach()
             embedded_text = emb_opt.detach().clone()
-            embedded_text = torch.cat([ini_prompt_embed,embedded_text,subset_embed],dim = 1)
 
-            image_syn_eval = synthesis(pipeline, 
+            image_syn_eval = synthesis(noise_scheduler, 
                                 embedded_text, 
-                                unet, 
+                                unet,
+                                ini_latents, 
                                 accelerator, 
-                                vae=vae,
-                                ini_latents=ini_latents,
-                                with_grad=False,
+                                vae,
                                 disable_tqdm=True).detach()
             
             args.lr_net = eval_pool_dict[model_eval]
