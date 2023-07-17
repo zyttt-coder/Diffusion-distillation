@@ -1,9 +1,16 @@
 import os
+import gc
 import torch
 import time
+import wandb
+import torchvision
 import numpy as np
-from networks import *
 import torch.nn.functional as F
+
+from torch import nn
+from tqdm.auto import tqdm
+from ema_pytorch import EMA
+from networks import *
 from torch.utils.data import Dataset
 
 class Config:
@@ -103,14 +110,11 @@ class TensorDataset(Dataset):
     def __len__(self):
         return self.images.shape[0]
 
-def get_default_convnet_setting():
-    net_width, net_depth, net_act, net_norm, net_pooling = 128, 3, 'relu', 'instancenorm', 'avgpooling'
-    return net_width, net_depth, net_act, net_norm, net_pooling
 
 
 def get_network(model, channel, num_classes, im_size=(32, 32), dist=True, depth=3, width=128, norm="instancenorm"):
     torch.random.manual_seed(int(time.time() * 1000) % 100000)
-    net_width, net_depth, net_act, net_norm, net_pooling = get_default_convnet_setting()
+    net_width, net_depth, net_act, net_norm, net_pooling = 128, 3, 'relu', 'instancenorm', 'avgpooling'
 
     if model == 'AlexNet':
         net = AlexNet(channel, num_classes=num_classes, im_size=im_size)
@@ -228,6 +232,56 @@ def match_loss(gw_syn, gw_real, args, accelerator):
     else:
         exit('DC error: unknown distance function')
     return dis
+
+def epoch(mode, dataloader, net, optimizer, criterion, args, accelerator, aug, class_map=None):
+    loss_avg, acc_avg, num_exp = 0, 0, 0
+    net = net.to(accelerator.device)
+
+    if "imagenet" in args.dataset_name:
+        assert class_map != None
+
+    if mode == 'train':
+        net.train()
+    else:
+        net.eval()
+
+    for i_batch, datum in enumerate(dataloader):
+        img = datum[0].to(accelerator.device)
+        lab = datum[1].to(accelerator.device)
+
+        if aug:
+            if args.dsa:
+                img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
+            else:
+                pass
+                #TODO: implement augment
+                # img = augment(img, args.dc_aug_param, device=accelerator.device)
+
+        if "imagenet" in args.dataset_name and mode != "train":
+            lab = torch.tensor([class_map[x.item()] for x in lab]).to(accelerator.device)
+
+        n_b = lab.shape[0]
+
+        output = net(img)
+        # print(output)
+        loss = criterion(output, lab)
+
+        predicted = torch.argmax(output.data, 1)
+        correct = (predicted == lab).sum()
+
+        loss_avg += loss.item()*n_b
+        acc_avg += correct.item()
+        num_exp += n_b
+
+        if mode == 'train':
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    loss_avg /= num_exp
+    acc_avg /= num_exp
+
+    return loss_avg, acc_avg
 
 def get_eval_pool(eval_mode, model, model_eval):
     if eval_mode == 'M': # multiple architectures
@@ -429,6 +483,314 @@ def rand_cutout(x, param):
     x = x * mask.unsqueeze(1)
     return x
 
+
+def get_eval_lrs(args):
+    eval_pool_dict = {
+        args.model: 0.001,
+        "ResNet18": 0.001,
+        "VGG11": 0.0001,
+        "AlexNet": 0.001,
+        "ViT": 0.001,
+
+        "AlexNetCIFAR": 0.001,
+        "ResNet18CIFAR": 0.001,
+        "VGG11CIFAR": 0.0001,
+        "ViTCIFAR": 0.001,
+    }
+
+    return eval_pool_dict
+
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, accelerator, decay="cosine", return_loss=False, test_it=100, aug=True, class_map=None):
+    net = net.to(accelerator.device)
+    images_train = images_train.to(accelerator.device)
+    labels_train = labels_train.to(accelerator.device)
+    lr = float(args.lr_net)
+    Epoch = int(args.epoch_eval_train)
+    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+
+    if decay == "cosine":
+        sched1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.0000001, end_factor=1.0, total_iters=Epoch//2)
+        sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epoch//2)
+
+    elif decay == "step":
+        lmbda1 = lambda epoch: 1.0
+        sched1 = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lmbda1)
+        lmbda2 = lambda epoch: 0.1
+        sched2 = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lmbda2)
+
+    sched = sched1
+
+    ema = EMA(net, beta=0.995, power=1, update_after_step=0, update_every=1)
+
+    criterion = nn.CrossEntropyLoss().to(accelerator.device)
+
+    dst_train = TensorDataset(images_train, labels_train)
+    trainloader = torch.utils.data.DataLoader(dst_train, batch_size=args.train_batch_size, shuffle=True, num_workers=0)
+
+    start = time.time()
+    acc_train_list = []
+    loss_train_list = []
+    acc_test_list = []
+    loss_test_list = []
+    acc_test_max = 0
+    acc_test_max_epoch = 0
+    for ep in tqdm(range(Epoch),disable=not accelerator.is_local_main_process):
+        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, accelerator, aug=aug, class_map=class_map)
+        acc_train_list.append(acc_train)
+        loss_train_list.append(loss_train)
+        ema.update()
+        sched.step()
+        if ep == Epoch // 2:
+            sched = sched2
+
+    with torch.no_grad():
+        loss_test, acc_test = epoch('test', testloader, ema, optimizer, criterion, args, accelerator, aug=False, class_map=class_map)
+    acc_test_list.append(acc_test)
+    loss_test_list.append(loss_test)
+    print("TestAcc Epoch {}:\t{}".format(ep, acc_test))
+    if acc_test > acc_test_max:
+        acc_test_max = acc_test
+        acc_test_max_epoch = ep
+        print("NewMax {} at epoch {}".format(acc_test_max, acc_test_max_epoch))
+
+    time_train = time.time() - start
+
+    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test_max))
+    print("Max {} at epoch {}".format(acc_test_max, acc_test_max_epoch))
+
+    if return_loss:
+        return net, acc_train_list, acc_test_list, loss_train_list, loss_test_list
+    else:
+        return net, acc_train_list, acc_test_list
+
+
+def eval_loop(args, accelerator, testloader, best_acc, best_std, model_eval_pool, it, channel, num_classes, im_size, label_syn, ini_prompt_embed, emb_opt, subset_embed, pipeline, unet, vae, ini_latents, class_map=None):
+    curr_acc_dict = {}
+    max_acc_dict = {}
+
+    curr_std_dict = {}
+    max_std_dict = {}
+
+    eval_pool_dict = get_eval_lrs(args)
+
+    save_this_it = False
+
+    for model_eval in model_eval_pool:
+        print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d' % (
+        args.model, model_eval, it))
+
+        accs_test = []
+        accs_train = []
+
+        for it_eval in range(args.num_eval):     #num_eval=5
+            net_eval = get_network(model_eval, channel, num_classes, im_size, width=args.width, depth=args.depth,
+                                   dist=False).to(accelerator.device)  # get a random model
+            label_syn_eval = label_syn.detach()
+            embedded_text = emb_opt.detach().clone()
+            embedded_text = torch.cat([ini_prompt_embed,embedded_text,subset_embed],dim = 1)
+
+            image_syn_eval = synthesis(pipeline, 
+                                embedded_text, 
+                                unet, 
+                                accelerator, 
+                                vae=vae,
+                                ini_latents=ini_latents,
+                                with_grad=False,
+                                disable_tqdm=True).detach()
+            
+            args.lr_net = eval_pool_dict[model_eval]
+            _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader,
+                                                     args=args, accelerator=accelerator, aug=True, class_map=class_map)
+            
+            del _
+            del net_eval
+            accs_test.append(acc_test)
+            accs_train.append(acc_train)
+
+        print(accs_test)
+        accs_test = np.array(accs_test)
+        accs_train = np.array(accs_train)
+        acc_test_mean = np.mean(np.max(accs_test, axis=1))
+        acc_test_std = np.std(np.max(accs_test, axis=1))
+        best_dict_str = "{}".format(model_eval)
+        if acc_test_mean > best_acc[best_dict_str]:
+            best_acc[best_dict_str] = acc_test_mean
+            best_std[best_dict_str] = acc_test_std
+            save_this_it = True
+
+        curr_acc_dict[best_dict_str] = acc_test_mean
+        curr_std_dict[best_dict_str] = acc_test_std
+
+        max_acc_dict[best_dict_str] = best_acc[best_dict_str]
+        max_std_dict[best_dict_str] = best_std[best_dict_str]
+
+        print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------' % (
+        len(accs_test[:, -1]), model_eval, acc_test_mean, np.std(np.max(accs_test, axis=1))))
+        accelerator.log({'Accuracy/{}'.format(model_eval): acc_test_mean}, step=it)
+        accelerator.log({'Max_Accuracy/{}'.format(model_eval): best_acc[best_dict_str]}, step=it)
+        accelerator.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
+        accelerator.log({'Max_Std/{}'.format(model_eval): best_std[best_dict_str]}, step=it)
+
+    accelerator.log({
+        'Accuracy/Avg_All'.format(model_eval): np.mean(np.array(list(curr_acc_dict.values()))),
+        'Std/Avg_All'.format(model_eval): np.mean(np.array(list(curr_std_dict.values()))),
+        'Max_Accuracy/Avg_All'.format(model_eval): np.mean(np.array(list(max_acc_dict.values()))),
+        'Max_Std/Avg_All'.format(model_eval): np.mean(np.array(list(max_std_dict.values()))),
+    }, step=it)
+
+    curr_acc_dict.pop("{}".format(args.model))
+    curr_std_dict.pop("{}".format(args.model))
+    max_acc_dict.pop("{}".format(args.model))
+    max_std_dict.pop("{}".format(args.model))
+
+    accelerator.log({
+        'Accuracy/Avg_Cross'.format(model_eval): np.mean(np.array(list(curr_acc_dict.values()))),
+        'Std/Avg_Cross'.format(model_eval): np.mean(np.array(list(curr_std_dict.values()))),
+        'Max_Accuracy/Avg_Cross'.format(model_eval): np.mean(np.array(list(max_acc_dict.values()))),
+        'Max_Std/Avg_Cross'.format(model_eval): np.mean(np.array(list(max_std_dict.values()))),
+    }, step=it)
+
+    return save_this_it
+
+def image_logging(args, it, accelerator, emb_opt, noise_scheduler, unet, vae, ini_latents):
+    embedded_text = emb_opt.detach().clone()
+
+    image_syn = synthesis(noise_scheduler, 
+                        embedded_text, 
+                        unet,
+                        ini_latents, 
+                        accelerator, 
+                        vae,
+                        disable_tqdm=True)
+
+    accelerator.log({"Embedding space": wandb.Histogram(torch.nan_to_num(embedded_text.detach().cpu()))}, step=it)
+
+    if args.ipc < 50:
+        upsampled = image_syn
+        # if "imagenet" not in args.dataset_name:
+        #     upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
+        #     upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
+        grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
+        accelerator.log({"Synthetic_Images": wandb.Image(torch.nan_to_num(grid.detach().cpu()))}, step=it)
+        accelerator.log({'Synthetic_Pixels': wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
+            
+    del upsampled, grid
+
+def decode_latents(vae, latents):
+    latents = 1 / 0.18215 * latents
+    image = vae.decode(latents.to(vae.dtype)).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    return image
+
+def encode_prompt(prompt, device):
+    num_classes, num_tokens, emb_ch = prompt.shape
+    text_embeddings = prompt.to(device)
+    weight = prompt.view(-1,emb_ch*num_tokens).transpose(0,1)  
+    weight = weight.to(device)
+
+    emb_weight = weight.detach()
+    uncond_embeddings = emb_weight.mean(
+        dim=1).view(1, num_tokens, -1)
+    
+    uncond_embeddings = uncond_embeddings.repeat(
+        num_classes, 1, 1)
+    uncond_embeddings = uncond_embeddings.view(
+        num_classes, num_tokens, -1)
+    
+    text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+    return text_embeddings
+
+
+def synthesis(noise_scheduler, 
+              embedded_text, 
+              unet, 
+              ini_latents,
+              accelerator,
+              vae,
+              with_grad=False,
+              num_inference_steps=50,
+              disable_tqdm=False):
+    
+    device = accelerator.device
+
+    noise_scheduler.set_timesteps(num_inference_steps, device=device)    
+    timesteps = noise_scheduler.timesteps
+
+    num_warmup_steps = len(timesteps) - num_inference_steps * noise_scheduler.order
+    if not disable_tqdm:
+        progress_bar = tqdm(range(num_inference_steps),
+                            disable=not accelerator.is_local_main_process)
+        description_string = "Synthesis "
+        if with_grad:
+            description_string = description_string + "with grad"
+        else:
+            description_string = description_string + "without grad"
+        progress_bar.set_description(description_string)
+
+
+    with torch.set_grad_enabled(with_grad):
+        prompt_embeds = encode_prompt(embedded_text,device)
+        latents = ini_latents
+
+        for i,t in enumerate(timesteps):
+            latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = noise_scheduler.scale_model_input(
+                    latent_model_input, t)
+            noise_pred = unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            return_dict=False,
+                        )[0]
+            
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + 2.0 * (noise_pred_text - noise_pred_uncond)
+
+            latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % noise_scheduler.order == 0):
+                if not disable_tqdm:
+                    progress_bar.update()
+
+        result = decode_latents(vae,latents)
+
+    return result
+
+
+def diffusion_backward(noise_scheduler, images_syn, emb_opt, sg_batch, unet, vae, accelerator, ini_latents):
+    device = accelerator.device
+    parameters_grad_list = []
+
+    for emb_opt_split, ini_latents_split, dLdx_split in zip(torch.split(emb_opt, sg_batch, dim=0),
+                                                            torch.split(ini_latents, sg_batch, dim=0),
+                                                            torch.split(images_syn.grad, sg_batch, dim=0)):
+        emb_opt_detached = emb_opt_split.detach().clone().requires_grad_(True)
+
+        syn_images = synthesis(noise_scheduler,
+                        emb_opt_detached,
+                        unet,
+                        ini_latents_split,
+                        accelerator,
+                        vae,
+                        with_grad=True)
+        
+        syn_images.backward((dLdx_split,))
+
+        parameters_grad_list.append(emb_opt_detached.grad)
+
+        del syn_images
+        del emb_opt_split
+        del emb_opt_detached
+        del ini_latents_split
+        del dLdx_split
+        
+
+        gc.collect()
+
+    emb_opt.grad = torch.cat(parameters_grad_list)
+    del parameters_grad_list
+
+            
 AUGMENT_FNS = {
     'color': [rand_brightness, rand_saturation, rand_contrast],
     'crop': [rand_crop],

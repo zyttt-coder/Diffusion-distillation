@@ -4,26 +4,25 @@ import logging
 import time
 import copy
 import random
+import wandb
 import os
-import gc
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torchvision
 import torchvision.transforms as transforms
-from torchvision.datasets import ImageFolder
+from torchvision.transforms import InterpolationMode
+from torchvision.datasets import ImageFolder         
 
 import datasets
 import diffusers
-import PIL
 import transformers
 from accelerate import Accelerator
-from diffusers import AutoencoderKL, UNet2DConditionModel, StableDiffusionPipeline
+
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler
 from diffusers.utils.import_utils import is_xformers_available
-from huggingface_hub import HfFolder, Repository, whoami
 
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel
@@ -31,102 +30,12 @@ from transformers import CLIPTextModel
 import warnings
 warnings.filterwarnings("ignore")
 
-import ml_collections
 import tensorflow as tf
 sys.path.append('.')  # NOQA
-from pipeline_emb import EmbModel
-from personalize import Config, get_network, ParamDiffAug, DiffAugment, match_loss, TensorDataset, get_eval_pool, get_time
+from personalize import Config, get_network, epoch, ParamDiffAug, DiffAugment, match_loss, TensorDataset, get_eval_pool, get_time, eval_loop, image_logging, synthesis, diffusion_backward, decode_latents
 tf.config.experimental.set_visible_devices([], "GPU")
 
-
 config = Config()
-
-
-# def np_tile_imgs(imgs, *, pad_pixels=1, pad_val=255, num_col=0):
-#     """NumPy utility: tile a batch of images into a single image.
-
-#     Args:
-#       imgs: np.ndarray: a uint8 array of images of shape [n, h, w, c]
-#       pad_pixels: int: number of pixels of padding to add around each image
-#       pad_val: int: padding value
-#       num_col: int: number of columns in the tiling; defaults to a square
-
-#     Returns:
-#       np.ndarray: one tiled image: a uint8 array of shape [H, W, c]
-#     """
-#     if pad_pixels < 0:
-#         raise ValueError('Expected pad_pixels >= 0')
-#     if not 0 <= pad_val <= 255:
-#         raise ValueError('Expected pad_val in [0, 255]')
-
-#     imgs = np.asarray(imgs)
-#     if imgs.dtype != np.uint8:
-#         raise ValueError('Expected uint8 input')
-#     # if imgs.ndim == 3:
-#     #   imgs = imgs[..., None]
-#     n, h, w, c = imgs.shape
-#     if c not in [1, 3]:
-#         raise ValueError('Expected 1 or 3 channels')
-
-#     if num_col <= 0:
-#         # Make a square
-#         ceil_sqrt_n = int(np.ceil(np.sqrt(float(n))))
-#         num_row = ceil_sqrt_n
-#         num_col = ceil_sqrt_n
-#     else:
-#         # Make a B/num_per_row x num_per_row grid
-#         assert n % num_col == 0
-#         num_row = int(np.ceil(n / num_col))
-
-#     imgs = np.pad(
-#         imgs,
-#         pad_width=((0, num_row * num_col - n), (pad_pixels, pad_pixels),
-#                    (pad_pixels, pad_pixels), (0, 0)),
-#         mode='constant',
-#         constant_values=pad_val
-#     )
-#     h, w = h + 2 * pad_pixels, w + 2 * pad_pixels
-#     imgs = imgs.reshape(num_row, num_col, h, w, c)
-#     imgs = imgs.transpose(0, 2, 1, 3, 4)
-#     imgs = imgs.reshape(num_row * h, num_col * w, c)
-
-#     if pad_pixels > 0:
-#         imgs = imgs[pad_pixels:-pad_pixels, pad_pixels:-pad_pixels, :]
-#     if c == 1:
-#         imgs = imgs[Ellipsis, 0]
-#     return imgs
-
-
-# def save_tiled_imgs(filename, imgs, pad_pixels=1, pad_val=255, num_col=0):
-#     PIL.Image.fromarray(
-#         np_tile_imgs(
-#             imgs, pad_pixels=pad_pixels, pad_val=pad_val,
-#             num_col=num_col)).save(filename)
-
-
-# def save_progress(emb_model, accelerator, save_path):
-#     logger.info("Saving embeddings")
-#     model = accelerator.unwrap_model(emb_model)
-#     learned_embeds = model.emb.weight
-#     learned_embeds_dict = {
-#         'emb.weight': learned_embeds.detach().cpu(),
-#     }
-#     torch.save(learned_embeds_dict, save_path)
-
-
-# def save_image(pipe, image_dir, step, num_emb, device, resolution):
-#     # prompt = list(range(25))
-#     prompt = list(range(1))
-#     pipe.to(device)
-#     # for guidance_scale in [2.0, 4.0]:
-#     for guidance_scale in [2.0]:
-#         filename = os.path.join(
-#             image_dir, f'{step:05d}_gs{guidance_scale}.jpg')
-#         logger.info(f"Saving images to {filename}")
-#         images = pipe(np.eye(num_emb)[prompt], height=resolution, width=resolution,
-#                       num_inference_steps=50, guidance_scale=guidance_scale, eta=1., generator=None).images
-#         images = np.stack([np.array(x) for x in images])
-#         save_tiled_imgs(filename, images)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -140,19 +49,24 @@ def parse_args():
     parser.add_argument('--depth', type=int, default=5)
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
     parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
+    parser.add_argument('--save_it', type=int, default=None, help='how often to evaluate')
+    parser.add_argument('--num_eval', type=int, default=5, help='the number of evaluating randomly initialized models')
     parser.add_argument('--eval_mode', type=str, default='M',
                     help='eval_mode')  # S: the same to training model, M: multi architectures
+    parser.add_argument('--epoch_eval_train', type=int, default=1000,
+                    help='epochs to train a model with synthetic data')
     parser.add_argument('--ipc', type=int, default=1, help='image(s) per class')
     parser.add_argument('--inner_loop', type=int, default=1, help='inner loop')
     parser.add_argument('--outer_loop', type=int, default=1, help='outer loop')
     parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
                     help='whether to use differentiable Siamese augmentation.')
     parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate',
-                    help='differentiable Siamese augmentation strategy')
+                    help='differentiable Siamese augmentation strategy')    
     parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
     parser.add_argument('--sg_batch', type=int, default=2)
     parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
+    parser.add_argument('--logdir', type=str, default='./logged_files')
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -256,10 +170,12 @@ def get_imagenet_dataset(dataset_name,data_dir,size=512,train_batch_size=256,tes
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
 
-    transform = transforms.Compose([transforms.ToTensor(),
-                                    transforms.Normalize(mean=mean, std=std),
-                                    transforms.Resize(size),
-                                    transforms.CenterCrop(size)])
+    transform = transforms.Compose([
+        transforms.Resize(
+            size, interpolation=InterpolationMode.BICUBIC, antialias=True),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+    ])
 
     dst_train = get_imagenet(data_dir,train=True,transform=transform)
     dst_train = torch.utils.data.Subset(dst_train, np.squeeze(np.argwhere(np.isin(dst_train.targets, config.img_net_classes))))
@@ -294,167 +210,46 @@ def build_dataset(ds, class_map, num_classes, accelerator):
 
     return images_all, labels_all, indices_class
 
-
-def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
+def optim_embed(emb_ch=768, num_classes=10, ipc=2, num_tokens=5, emb_path=None):
+    if emb_path:
+        # emb = EmbModel(emb_ch=emb_ch, num_emb=num_classes, num_tokens=5)
+        weight = torch.load(os.path.join(os.getcwd(),emb_path))['emb.weight']
+        emb = weight.transpose(0,1).view(-1,num_tokens,emb_ch).detach().clone()
+        # emb.load_state_dict(ckpt)
+        # emb.to(torch.float32)
+        return (emb,weight)
     else:
-        return f"{organization}/{model_id}"
+        return torch.randn((ipc*num_classes,num_tokens,emb_ch))
 
-def synthesis(pipeline, 
-              embedded_text, 
-              unet, 
-              accelerator, 
-              vae=None, 
-              ini_latents=None, 
-              im_size=None, 
-              num_classes=None, 
-              ipc=None, 
-              with_grad=False, 
-              return_ini=False, 
-              return_latents=False,
-              num_inference_steps=50):
+def prepare_latents(batch_size, num_channels_latents, height, width, dtype, device, generator, vae, noise_scheduler, latents=None):
+    vae_scale_factor = 2 ** (
+            len(vae.config.block_out_channels) - 1)
+    shape = (batch_size, num_channels_latents, height //
+            vae_scale_factor, width // vae_scale_factor)
     
-    device = accelerator.device
-
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)    
-    timesteps = pipeline.scheduler.timesteps
-
-    num_warmup_steps = len(timesteps) - num_inference_steps * pipeline.scheduler.order
-    progress_bar = tqdm(range(num_inference_steps),
-                        disable=not accelerator.is_local_main_process)
-    description_string = "Synthesis "
-    if with_grad:
-        description_string = description_string + "with grad"
-    else:
-        description_string = description_string + "without grad"
-    progress_bar.set_description(description_string)
-
-
-    with torch.set_grad_enabled(with_grad):
-        prompt_embeds = pipeline._encode_prompt(
-                                prompt=None,
-                                device=device,
-                                num_images_per_prompt=1,
-                                do_classifier_free_guidance=True,
-                                prompt_embeds=embedded_text,
-                            )
-        
-        latents = ini_latents
-        if latents == None:
-            assert im_size != None and ipc != None and num_classes != None
-            num_channels_latents = unet.config.in_channels
-            latents = pipeline.prepare_latents(
-                            num_classes*ipc,
-                            num_channels_latents,
-                            im_size[0],
-                            im_size[1],
-                            prompt_embeds.dtype,
-                            device,
-                            generator=None,
-                        )
-            ini_latents = latents
-
-        for i,t in enumerate(timesteps):
-            latent_model_input = torch.cat([latents] * 2)
-            noise_pred = unet(
-                            latent_model_input,
-                            t,
-                            encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs=None,
-                            return_dict=False,
-                        )[0]
-            
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond)
-
-            latents = pipeline.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipeline.scheduler.order == 0):
-                progress_bar.update()
-
-        if return_latents:
-            if return_ini:
-                result = torch.cat([ini_latents,latents])
-            else:
-                result = latents
-        else:
-            assert vae != None
-            image = vae.decode(latents / vae.config.scaling_factor, return_dict=False)[0]
-            image = torch.stack([(image[i] / 2 + 0.5).clamp(0, 1) for i in range(image.shape[0])])
-            result = image
+    latents = torch.randn(
+                    shape, generator=generator, dtype=dtype).to(device)
     
-
-    return result
-
-
-def diffusion_backward(pipeline, images_syn, parameters, ini_prompt_token, placeholder_token, ini_prompt_embed, sg_batch, unet, vae, accelerator, ini_latents):
-    device = accelerator.device
-    parameters_grad_list = []
-
-    for parameters_split, prompt_embed_split, ini_latents_split, dLdx_split in zip(torch.split(parameters, sg_batch, dim=0),
-                                                                                    torch.split(ini_prompt_embed, sg_batch, dim=0),
-                                                                                    torch.split(ini_latents, sg_batch, dim=0),
-                                                                                    torch.split(images_syn.grad, sg_batch, dim=0)):
-        parameters_detached = parameters_split.detach().clone().requires_grad_(True)
-        prompt_embed_clone = prompt_embed_split.clone()
-        for i in range(parameters_detached.shape[0]):
-            prompt_embed_clone[i][torch.argwhere(ini_prompt_token == placeholder_token.to(device)).squeeze()] = parameters_detached[i]
-
-        syn_images = synthesis(pipeline,
-                        prompt_embed_clone,
-                        unet,
-                        accelerator,
-                        vae=vae,
-                        ini_latents=ini_latents_split,
-                        with_grad=True)
-        
-        syn_images.backward((dLdx_split,))
-
-        parameters_grad_list.append(parameters_detached.grad)
-
-        del syn_images
-        del parameters_split
-        del prompt_embed_split
-        del prompt_embed_clone
-        del ini_latents_split
-        del dLdx_split
-        del parameters_detached
-
-        gc.collect()
-
-    parameters.grad = torch.cat(parameters_grad_list)
-    del parameters_grad_list
+    latents = latents * noise_scheduler.init_noise_sigma
+    return latents
 
 def main():
-    torch.random.manual_seed(0)
-    np.random.seed(0)
-    random.seed(0)
-
     args = parse_args()
     args.dsa_param = ParamDiffAug()
     args.dsa = False if args.dsa_strategy in ['none', 'None'] else True
 
     args.data_dir = os.path.join(os.getcwd(),args.data_dir)
 
-
-    run_dir = time.strftime("%Y%m%d-%H%M%S")
-
-    args.save_path = os.path.join(args.save_path, "dc", run_dir)
-
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path, exist_ok=True)
-
     accelerator = Accelerator(log_with="wandb")
     accelerator.init_trackers(
-        project_name="Diffusion distillation", 
-        config=args
+        "Diffusion distillation",
+        config=args.__dict__,
+        init_kwargs={
+            "wandb": {
+                "job_type":"DC"
+            }
+        },
     )
-    wandb_tracker = accelerator.get_tracker("wandb")
-
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -479,6 +274,9 @@ def main():
     )
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    )
+    noise_scheduler = PNDMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler", revision=args.revision
     )
 
     # Freeze vae and unet
@@ -507,16 +305,14 @@ def main():
     for key in model_eval_pool:
         accs_all_exps[key] = []
         
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        safety_checker=None,
-        torch_dtype=weight_dtype,
-    ).to(accelerator.device)
-
-    emb_model = EmbModel(tokenizer=pipeline.tokenizer,
-                         device=accelerator.device,
+    emb_ch = text_encoder.config.hidden_size
+    num_tokens=5
+    emb_opt,weight = optim_embed(emb_ch=emb_ch,
+                         num_classes=num_classes,
                          ipc=args.ipc,
-                         num_classes=num_classes)
+                         num_tokens=num_tokens,
+                         emb_path="logs/imagenet/res128_bicubic/emb10_token5_lr0.03_constant/group0/learned_embeds.bin")
+    
 
     if accelerator.is_local_main_process:
         print("BUILDING DATASET")
@@ -525,7 +321,7 @@ def main():
     def get_images(c, n):  # get random n images from class c
         idx_shuffle = np.random.permutation(indices_class[c])[:n]
         return images_all[idx_shuffle].to(accelerator.device)
-
+        
     if args.gradient_checkpointing:
         # Keep unet in train mode if we are using gradient checkpointing to save memory.
         # The dropout cannot be != 0 so it doesn't matter if we are in eval or train mode.
@@ -547,7 +343,7 @@ def main():
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
-        [emb_model.embedding_parameters()],
+        [emb_opt],
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -555,8 +351,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    emb_model, optimizer, images_all = accelerator.prepare(
-        emb_model, optimizer, images_all
+    optimizer, images_all = accelerator.prepare(
+        optimizer, images_all
     )
 
     # Move vae, unet and text encoder to device and cast to weight_dtype
@@ -571,7 +367,35 @@ def main():
         print('Hyper-parameters: \n', args.__dict__)
         print('Evaluation model pool: ', model_eval_pool)
 
-    for epoch in range(args.num_train_steps):
+    best_acc = {"{}".format(m): 0 for m in model_eval_pool}
+    best_std = {m: 0 for m in model_eval_pool}
+    save_this_it = False
+
+    num_channels_latents = unet.config.in_channels
+    ini_latents = prepare_latents(
+                    num_classes*args.ipc,
+                    num_channels_latents,
+                    im_size[0],
+                    im_size[1],
+                    emb_opt.dtype,
+                    accelerator.device,
+                    None,
+                    vae,
+                    noise_scheduler
+                )
+    image_logging(args, 0, accelerator, emb_opt, noise_scheduler, unet, vae, ini_latents)
+    
+
+    for it in range(args.num_train_steps):
+        # if it in eval_it_pool and it > 0:
+        #     save_this_it = eval_loop(args, accelerator, test_dataloader, best_acc, best_std, 
+        #                              model_eval_pool, it, channel, num_classes, im_size, label_syn, 
+        #                              ini_prompt_embed, emb_opt, subset_embed, pipeline, unet, vae, ini_latents, class_map = class_map)
+            
+        if it > 0 and ((it in eval_it_pool and (save_this_it or it % 1000 == 0)) or (
+            args.save_it is not None and it % args.save_it == 0)):
+            image_logging(args, it, accelerator, emb_opt, noise_scheduler, unet, vae, ini_latents)
+
         net = get_network(args.model, channel, num_classes, im_size, depth=args.depth, width=args.width).to(accelerator.device) # get a random model
         net.train()
         net_parameters = list(net.parameters())
@@ -580,7 +404,6 @@ def main():
         loss_avg = 0
 
         for ol in range(args.outer_loop):
-
             BN_flag = False
             BNSizePC = 16  # for batch normalization
             for module in net.modules():
@@ -594,40 +417,15 @@ def main():
                     if 'BatchNorm' in module._get_name():  #BatchNorm
                         module.eval() # fix mu and sigma of every BatchNorm layer
 
-            ini_prompt = "An image of * " + subset
-            ini_prompt_token = pipeline.tokenizer(
-                    [ini_prompt],
-                    padding="max_length",
-                    max_length= 77,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-            ini_prompt_token = ini_prompt_token.input_ids[:,:7].to(accelerator.device)
-            ini_prompt_embed = text_encoder(
-                ini_prompt_token,
-                attention_mask=None,
-            )
-            ini_prompt_embed = ini_prompt_embed[0]
-            ini_prompt_embed = ini_prompt_embed.repeat(num_classes*args.ipc,1,1)
-            embedded_text = ini_prompt_embed.detach().clone()
-            emb_model(ini_prompt_token[0],embedded_text)
-
-            latents = synthesis(pipeline, 
-                                embedded_text, 
-                                unet, 
-                                accelerator, 
-                                im_size=im_size, 
-                                num_classes=num_classes, 
-                                ipc=args.ipc,
-                                return_ini=True,
-                                return_latents=True)
-
-            ini_latents = latents[:num_classes*args.ipc,:,:,:]
-            denoise_latents = latents[num_classes*args.ipc:,:,:,:]
+            embedded_text = emb_opt.detach().clone()
 
             #sythesis image
-            image = vae.decode(denoise_latents / vae.config.scaling_factor, return_dict=False)[0]
-            image_syn = torch.stack([(image[i] / 2 + 0.5).clamp(0, 1) for i in range(image.shape[0])])
+            image_syn = synthesis(noise_scheduler, 
+                                embedded_text, 
+                                unet,
+                                ini_latents,
+                                accelerator, 
+                                vae)
             label_syn = torch.cat([torch.ones(args.ipc, device=accelerator.device, dtype=torch.long)*c for c in range(num_classes)])
             images_syn = image_syn.detach()
             images_syn.requires_grad_(True)
@@ -638,7 +436,18 @@ def main():
                 
                 img_real = get_images(c, args.train_batch_size)
                 lab_real = torch.ones((img_real.shape[0],), device=accelerator.device, dtype=torch.long) * c   #[c,c,c,c,...,c,c,c]
-                
+
+                #test_case
+                #--------------------------------------#
+                # indice = indices_class[c][:1]
+                # img_real = images_all[indice].to(accelerator.device)
+                # img_real = np.array(img_real.cpu()).astype(np.uint8)
+                # img_real = (img_real / 127.5 - 1.0).astype(np.float32)
+                # img_real = torch.from_numpy(img_real).to(accelerator.device)
+
+                # lab_real = torch.ones((img_real.shape[0],), device=accelerator.device, dtype=torch.long) * c   #[c,c,c,c,...,c,c,c]
+                #--------------------------------------#
+
                 img_syn = images_syn[c*args.ipc:(c+1)*args.ipc]
                 lab_syn = torch.ones((args.ipc,), device=accelerator.device, dtype=torch.long) * c   # [c]
                 
@@ -664,12 +473,9 @@ def main():
 
                 del img_real, output_real, loss_real, gw_real, output_syn, loss_syn, gw_syn, loss
 
-            diffusion_backward(pipeline,
+            diffusion_backward(noise_scheduler,
                                images_syn,
-                               emb_model.embedding_parameters(),
-                               ini_prompt_token[0],
-                               emb_model.string_to_token_dict["*"],
-                               ini_prompt_embed,
+                               emb_opt,
                                args.sg_batch,
                                unet,
                                vae,
@@ -685,23 +491,17 @@ def main():
             ''' update network '''
             image_syn_train, label_syn_train = copy.deepcopy(images_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
             dst_syn_train = TensorDataset(image_syn_train, label_syn_train)
-            trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
+            trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.train_batch_size, shuffle=True, num_workers=0)
             for il in range(args.inner_loop):
-                epoch('train', trainloader, net, optimizer_net, criterion, args, aug = True if args.dsa else False)
+                epoch('train', trainloader, net, optimizer_net, criterion, args, accelerator, aug = True if args.dsa else False, class_map = class_map)
+
+        loss_avg /= (num_classes*args.outer_loop)
+
+        accelerator.log({
+            "Loss": loss_avg
+        }, step=it)
 
     accelerator.end_training()
-
-    # # Create the pipeline using using the trained modules and save it.
-    # accelerator.wait_for_everyone()
-    # if accelerator.is_main_process:
-    #     save_path = os.path.join(args.output_dir, "learned_embeds.bin")
-    #     save_progress(emb_model, accelerator, save_path)
-
-    #     if args.push_to_hub:
-    #         repo.push_to_hub(commit_message="End of training",
-    #                          blocking=False, auto_lfs_prune=True)
-
-    # accelerator.end_training()
 
 
 if __name__ == "__main__":
