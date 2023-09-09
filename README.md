@@ -6,12 +6,12 @@ Ours_initilized:
 Ours_distilled:  
 <img src="imgs/distilled.png">
 
-This project utilizes Stable Diffusion to do data distillation. The core idea is to optimize token embeddings to guide the generation of distilled images. To enhance the distillation result, token embeddings are initialized using the method in paper [["Training on Thin Air: Improve Image Classification with Generated Data"]](https://arxiv.org/pdf/2305.15316.pdf). The distillation method used in the project is Gradient matching. For the details of distillation method and pipeline, please refer to paper [[Generalizing Dataset Distillation via Deep Generative Prior"]](https://arxiv.org/pdf/2305.01649.pdf).  
+This project utilizes Stable Diffusion to do data distillation. The core idea is to optimize token embeddings to guide the generation of distilled images. To enhance the distillation result, token embeddings are initialized using the method in paper ["Training on Thin Air: Improve Image Classification with Generated Data"](https://arxiv.org/pdf/2305.15316.pdf). The distillation method used in the project is Gradient matching. For the details of distillation method and pipeline, please refer to paper ["Generalizing Dataset Distillation via Deep Generative Prior"](https://arxiv.org/pdf/2305.01649.pdf).  
 
 ## Data and Model preparation
 For the data to distill, this project uses a 10-classes subset of Imagenet. Before running the codes, the imagenet dataset should be downloaded and stored to a folder named "imagenet". Within the folder, training dataset and evaluation dataset should be separated and stored to two folders named "imagenet_train" and "imagenet_val", respectively.  
 
-To prepare the stable diffusion model, checkpoints should be downloaded. Following the file structure on HuggingFace, the user needs to download "CompVis/stable-diffusion-v1-4".  
+To prepare the stable diffusion model, checkpoints should be downloaded. Following the file structure on HuggingFace, the user needs to download ["CompVis/stable-diffusion-v1-4"](https://huggingface.co/CompVis/stable-diffusion-v1-4/tree/main).  
 
 ## Running codes
 To get started, first create an enviroment:
