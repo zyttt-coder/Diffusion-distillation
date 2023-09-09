@@ -1,8 +1,8 @@
 # Diffusion-distillation
 SOTA_distilled:  
-<img src="imgs/SOTA.png">
+<img src="imgs/SOTA.png" width = "300" height = "200">
 Ours_initilized:  
-<img src="imgs/initial.jpg">  
+<img src="imgs/initial.jpg" width = "300" height = "200">  
 Ours_distilled:  
 <img src="imgs/distilled.png">
 
