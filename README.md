@@ -2,7 +2,7 @@
 SOTA_distilled:  
 <img src="imgs/SOTA.png">
 Ours_initilized:  
-<img src="imgs/initial.jpg">
+<img src="imgs/initial.jpg">  
 Ours_distilled:  
 <img src="imgs/distilled.png">
 
