@@ -1,10 +1,10 @@
 # Diffusion-distillation
 SOTA_distilled:  
-<img src="imgs/SOTA.png" width = "300" height = "200">
+<img src="imgs/SOTA.png" width = "300" height = "200">  
 Ours_initilized:  
 <img src="imgs/initial.jpg" width = "300" height = "200">  
 Ours_distilled:  
-<img src="imgs/distilled.png">
+<img src="imgs/distilled.png">  
 
 This project utilizes Stable Diffusion to do data distillation. The core idea is to optimize token embeddings to guide the generation of distilled images. To enhance the distillation result, token embeddings are initialized using the method in paper ["Training on Thin Air: Improve Image Classification with Generated Data"](https://arxiv.org/pdf/2305.15316.pdf). The distillation method used in the project is Gradient matching. For the details of distillation method and pipeline, please refer to paper ["Generalizing Dataset Distillation via Deep Generative Prior"](https://arxiv.org/pdf/2305.01649.pdf).  
 
